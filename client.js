@@ -26,11 +26,11 @@ window.__ModuleLoader__.load({
     const module = { exports: {} }
     const exports = module.exports
     const React = require('react')
-    const { createElement: h, Fragment, useState, useEffect, useMemo, useRef, useCallback } = React
+    const { createElement: h, useState, useEffect, useMemo, useRef, useCallback } = React
     const P = require('@deepseek-ai/dsh-client-ui-primitives')
     const { createSnapshotStore } = require('@deepseek-ai/dsh-client-store')
     const {
-      Button, Modal, MenuItemButton, Checkbox,
+      Button, Modal, MenuItemButton, RiskConfirmation, Checkbox,
       IconTrashOutlineRegular, IconWarningOutlineRegular, IconDownloadOutlineRegular,
     } = P
 
@@ -49,7 +49,6 @@ window.__ModuleLoader__.load({
         'dialog.created': '创建时间',
         'dialog.size': '日志大小',
         'dialog.descendants': '包含子会话',
-        'dialog.cascade': '将同时删除 {n} 个子会话及其后代。子会话在侧边栏不可见，无法通过其它方式单独删除。',
         'dialog.liveNote': '该会话仍在运行。删除前会先停止它的工作，然后移除日志。',
         'dialog.loading': '正在读取会话信息…',
         'dialog.failed': '无法读取会话信息：{reason}',
@@ -74,7 +73,6 @@ window.__ModuleLoader__.load({
         'dialog.created': 'Created',
         'dialog.size': 'Log size',
         'dialog.descendants': 'Includes subagents',
-        'dialog.cascade': 'This also deletes {n} subagent session(s) and their descendants. Subagents are hidden from the sidebar and cannot be deleted separately.',
         'dialog.liveNote': 'This session is still running. Its work is stopped first, then the log is removed.',
         'dialog.loading': 'Reading session…',
         'dialog.failed': 'Could not read the session: {reason}',
@@ -207,58 +205,6 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * Risk-gated confirmation composed from `Modal`.
-     *
-     * NOT `RiskConfirmation`: that primitive's signature takes no `children`
-     * — its body is hardcoded to the warning row plus the acknowledgement
-     * checkbox — so anything a caller passes as children is silently dropped.
-     * Its gate semantics (confirm disabled until acknowledged) are reproduced
-     * here on `Modal`, which does render children.
-     */
-    function RiskDialog({ open, title, description, acknowledgeLabel, cancelLabel, closeLabel, confirmLabel, acknowledged, disabled = false, onAcknowledgedChange, onCancel, onConfirm, children }) {
-      return h(Modal, {
-        open,
-        onClose: onCancel,
-        title,
-        closeLabel,
-        footer: h(Fragment, null, [
-          h(Button, { key: 'cancel', variant: 'outline', onClick: onCancel }, cancelLabel),
-          h(Button, {
-            key: 'confirm',
-            variant: 'primary',
-            disabled: disabled || !acknowledged,
-            onClick: onConfirm,
-          }, confirmLabel),
-        ]),
-      }, [
-        h('div', {
-          key: 'warn',
-          className: 'dsh-session-delete-warning',
-          style: { display: 'flex', gap: 8, alignItems: 'flex-start', margin: '4px 0 12px' },
-        }, [
-          h(IconWarningOutlineRegular, { key: 'i', size: 18 }),
-          h('p', { key: 't', style: { margin: 0 } }, description),
-        ]),
-        h(Fragment, { key: 'body' }, children),
-        h('label', {
-          key: 'ack',
-          className: 'dsh-session-delete-ack',
-          style: { display: 'flex', gap: 8, alignItems: 'center', marginTop: 12, cursor: 'pointer' },
-        }, [
-          h('input', {
-            key: 'c',
-            type: 'checkbox',
-            checked: acknowledged,
-            disabled,
-            'data-modal-autofocus': true,
-            onChange: (event) => { onAcknowledgedChange(event.currentTarget.checked) },
-          }),
-          h('span', { key: 'l' }, acknowledgeLabel),
-        ]),
-      ])
-    }
-
-    /**
      * The confirmation dialog. Nothing while no request is pending, otherwise
      * one dialog per request keyed by the session, so a new request starts a
      * fresh acknowledgement and a fresh in-flight state.
@@ -324,11 +270,7 @@ window.__ModuleLoader__.load({
       const descendants = Number(entry?.descendantCount) || 0
       const loading = entry === null && loadError === null
 
-      // Composed from Modal, NOT RiskConfirmation: that primitive takes no
-      // `children` (its body is hardcoded to warning + checkbox), so every
-      // fact row, the export link, and the loading/error lines passed below
-      // would be silently dropped.
-      return h(RiskDialog, {
+      return h(RiskConfirmation, {
         open: true,
         title: t('dialog.title'),
         description: t('dialog.desc'),
@@ -370,12 +312,6 @@ window.__ModuleLoader__.load({
         ]),
 
         live && h('div', { key: 'live', className: 'dsh-session-delete-note', role: 'note' }, t('dialog.liveNote')),
-
-        // Say what else goes. Silently removing child logs — or leaving them as
-        // unreachable orphans — would both be surprises; neither is acceptable
-        // for an irreversible action.
-        descendants > 0 && h('div', { key: 'cascade', className: 'dsh-session-delete-note', role: 'note' },
-          t('dialog.cascade', { n: String(descendants) })),
 
         h('div', { key: 'export', className: 'dsh-session-delete-export' }, [
           h('div', { key: 'hint', className: 'dsh-session-delete-export-hint' }, [

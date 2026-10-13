@@ -331,21 +331,18 @@ class SessionDeleteService {
   }
 
   /**
-   * Delete one session durably, and by default its whole descendant subtree.
+   * Delete one session durably.
    *
-   * The order matters. Every provider is asked to stop the session's work
-   * first, because removing a directory under an active writer tears the log.
-   * The flush barrier then makes sure a session that only *looks* cold has
-   * nothing buffered. Only then are the target directories located and
-   * validated — all of them, before any is removed — and finally deleted.
-   * Registry cleanup and announcement run last and never fail the delete: the
-   * logs are already gone, and a dangling id costs one blank row, not data.
+   * The order matters. A live session is refused before anything else because
+   * removing the directory under an active writer tears the log. The flush
+   * barrier then makes sure a session that only *looks* cold has nothing
+   * buffered. Only after both is the directory located, verified, and removed.
+   * Registry cleanup runs last and never fails the delete: the log is already
+   * gone, and a dangling id in an archive set costs one blank row, not data.
    * @param sessionId - the session to delete.
-   * @param options - `cascade` (default true) also deletes every descendant.
    * @returns what happened, including how much was freed.
    */
-  async delete(sessionId, options = {}) {
-    const cascade = options.cascade !== false
+  async delete(sessionId) {
     const id = String(sessionId)
     if (!ID_RE.test(id) || id.length > ID_MAX) {
       throw new DeleteRefused('invalid-id', `not a valid session id: ${JSON.stringify(id)}`)
@@ -386,164 +383,56 @@ class SessionDeleteService {
     const dir = sessionDirOf(root, snapshot.header.cwd, id)
     await this.assertInsideRoot(root, dir, id)
 
-    // The whole subtree goes: see descendantIds for why leaving children is a
-    // dead end rather than a choice. `cascade: false` is the escape hatch for a
-    // caller that really wants only this one session.
-    const subtree = cascade ? await this.descendantIds(id) : []
-
-    // Phase 1 — resolve and validate EVERY directory before anything is
-    // removed. A half-deleted lineage (parent gone, one child refused) is worse
-    // than none gone: the orphans become unreachable immediately. So a single
-    // refusal anywhere aborts the whole request and touches nothing.
-    const targets = []
-    for (const memberId of [id, ...subtree]) {
-      const member = memberId === id ? snapshot : (this.known.get(memberId) ?? await persistence.stat(memberId))
-      if (member === undefined) continue // already absent; nothing to validate
-      const memberDir = sessionDirOf(root, member.header.cwd, memberId)
-      await this.assertInsideRoot(root, memberDir, memberId)
-      let present = true
-      try {
-        await fs.promises.stat(memberDir)
-      } catch (error) {
-        if (error?.code !== 'ENOENT') {
-          throw new DeleteRefused('io', `failed to read the session directory: ${String(error?.message ?? error)}`)
-        }
-        present = false
+    // The snapshot says the session exists, but the directory may already be
+    // gone (a stale stat, a concurrent delete). Probe it directly: `rm
+    // force:true` would otherwise treat the missing tree as a success and
+    // report a removal that never happened.
+    try {
+      await fs.promises.stat(dir)
+    } catch (error) {
+      if (error?.code !== 'ENOENT') {
+        throw new DeleteRefused('io', `failed to read the session directory: ${String(error?.message ?? error)}`)
       }
-      if (!present) continue
-      // A refusal here names the offending session, because with a subtree the
-      // user otherwise has no way to tell which member tripped it.
-      try {
-        await this.assertDeletable(memberDir)
-      } catch (error) {
-        if (error instanceof DeleteRefused) {
-          throw new DeleteRefused(error.code, `subtree member ${JSON.stringify(memberId)}: ${error.message}`)
-        }
-        throw error
-      }
-      targets.push({ id: memberId, dir: memberDir })
-    }
-
-    if (targets.length === 0) {
       const cleaned = await this.cleanRegistries(id)
-      for (const memberId of subtree) await this.cleanRegistries(memberId)
-      this.publishRemoval(id)
-      for (const memberId of subtree) this.publishRemoval(memberId)
       this.known.delete(id)
-      return {
-        deleted: false, absent: true, freedBytes: 0, registryCleaned: cleaned,
-        descendants: { requested: subtree.length, deleted: 0, ids: subtree },
-      }
+      this.publishRemoval(id)
+      return { deleted: false, absent: true, freedBytes: 0, registryCleaned: cleaned }
     }
 
-    // Phase 2 — remove everything now that the whole set is known-good.
     let freedBytes = 0
-    const removedIds = []
-    for (const target of targets) {
-      try {
-        freedBytes += await this.directorySize(target.dir)
-        await fs.promises.rm(target.dir, { recursive: true, force: true })
-        removedIds.push(target.id)
-      } catch (error) {
-        if (error instanceof DeleteRefused) throw error
-        const code = error?.code
-        if (code === 'ENOENT') continue // vanished between validate and remove
-        if (code === 'EPERM' || code === 'EBUSY' || code === 'EACCES' || code === 'ETXTBSY') {
-          throw new DeleteRefused('session/in-use', `subtree member ${JSON.stringify(target.id)}: this session is still held open by a writer; close it and try again`)
-        }
-        throw new DeleteRefused('io', `failed to remove the session directory: ${String(error?.message ?? error)}`)
+    let removed = false
+    try {
+      freedBytes = await this.directorySize(dir)
+      await this.assertDeletable(dir)
+      await fs.promises.rm(dir, { recursive: true, force: true })
+      removed = true
+    } catch (error) {
+      if (error instanceof DeleteRefused) throw error
+      const code = error?.code
+      if (code === 'ENOENT') {
+        const cleaned = await this.cleanRegistries(id)
+        this.publishRemoval(id)
+        return { deleted: false, absent: true, freedBytes: 0, registryCleaned: cleaned }
       }
+      // A held handle means a writer is still attached despite the stop
+      // request. Windows surfaces this as EPERM/EBUSY, POSIX as EACCES/ETXTBSY.
+      // Report it as what it is rather than as a generic I/O fault, because the
+      // remedy is to close the session, not to retry.
+      if (code === 'EPERM' || code === 'EBUSY' || code === 'EACCES' || code === 'ETXTBSY') {
+        throw new DeleteRefused('session/in-use', 'this session is still held open by a writer; close it and try again')
+      }
+      throw new DeleteRefused('io', `failed to remove the session directory: ${String(error?.message ?? error)}`)
     }
 
-    const removed = removedIds.includes(id)
-    const descendantRemoved = removedIds.filter((memberId) => memberId !== id)
-
-    // Registries and announcement for every member that actually went.
-    let cleaned = true
-    for (const memberId of removedIds) {
-      if ((await this.cleanRegistries(memberId)) === false) cleaned = false
-      this.known.delete(memberId)
-      this.publishRemoval(memberId)
-    }
-    // Members with no directory still need their dangling registry entries gone.
-    if (removed === false && (await this.cleanRegistries(id)) === false) cleaned = false
-    for (const memberId of subtree) {
-      if (removedIds.includes(memberId)) continue
-      await this.cleanRegistries(memberId)
-      this.publishRemoval(memberId)
-    }
+    // 4. Registries. Never fails the delete.
+    const cleaned = await this.cleanRegistries(id)
     this.known.delete(id)
 
-    return {
-      deleted: removed, absent: !removed, freedBytes, registryCleaned: cleaned,
-      descendants: { requested: subtree.length, deleted: descendantRemoved.length, ids: descendantRemoved },
-    }
-  }
+    // 5. Tell every attached browser the row is gone. Without this the sidebar
+    //    keeps the session until some later reconnect rebuilds its baseline.
+    this.publishRemoval(id)
 
-  /**
-   * Every session id in one session's descendant subtree, nearest first.
-   *
-   * A subagent child is a first-class session with its own log directory, and
-   * the sidebar never renders one (`origin === 'subagent'` rows are hidden), so
-   * a parent deleted alone leaves children that are unreachable from the UI and
-   * permanent on disk. Deletion therefore carries its subtree.
-   *
-   * The trace engine is preferred; it already recurses to arbitrary depth over
-   * the whole logical corpus. When the query service is absent the same tree is
-   * rebuilt from the `parentSession` links in the persistence listing already
-   * in memory. Neither path touches the filesystem — still no scan of the
-   * sessions root.
-   * @param id - the root of the subtree.
-   * @returns descendant ids excluding `id` itself, deduplicated.
-   */
-  async descendantIds(id) {
-    const query = this.query
-    if (query !== undefined) {
-      try {
-        const trace = await query.traceSession(id)
-        const found = []
-        const seen = new Set([id])
-        const walk = (nodes) => {
-          for (const node of nodes) {
-            const childId = String(node.session.header.id)
-            if (seen.has(childId)) continue // defensive belt: cycles cannot recurse forever
-            seen.add(childId)
-            found.push(childId)
-            walk(node.descendants)
-          }
-        }
-        walk(trace.descendants ?? [])
-        return found
-      } catch { /* fall through to the header walk */ }
-    }
-
-    const persistence = this.persistence
-    if (persistence === undefined) return []
-    let snapshots
-    try {
-      snapshots = await persistence.list()
-    } catch {
-      return []
-    }
-    const childrenByParent = new Map()
-    for (const snapshot of snapshots) {
-      const parent = snapshot.header?.parentSession
-      if (parent === undefined) continue
-      const bucket = childrenByParent.get(String(parent)) ?? []
-      bucket.push(String(snapshot.header.id))
-      childrenByParent.set(String(parent), bucket)
-    }
-    const found = []
-    const seen = new Set([id])
-    const queue = [...(childrenByParent.get(id) ?? [])]
-    while (queue.length > 0) {
-      const childId = String(queue.shift())
-      if (seen.has(childId)) continue
-      seen.add(childId)
-      found.push(childId)
-      for (const grandchild of childrenByParent.get(childId) ?? []) queue.push(grandchild)
-    }
-    return found
+    return { deleted: removed, absent: !removed, freedBytes, registryCleaned: cleaned }
   }
 
   /** Refuse a target that escapes the sessions root. */
@@ -899,7 +788,7 @@ function mountRoutes(ctx, service, server) {
           json(response, 400, { ok: false, code: 'bad-body', error: 'sessionId is required' })
           return
         }
-        const result = await service.delete(sessionId, { cascade: payload?.cascade !== false })
+        const result = await service.delete(sessionId)
         json(response, 200, { ok: true, ...result })
       })
     },
