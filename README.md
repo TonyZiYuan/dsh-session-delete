@@ -22,7 +22,7 @@ DSH 自身不提供删除会话的能力：`SessionPersistence` 只有 `create`/
 ### 方式一：从 Git 仓库安装（推荐）
 
 ```bash
-dsh plugin --profile web add git+https://github.com/<you>/<repo>.git
+dsh plugin --profile web add git+https://github.com/TonyZiYuan/dsh-session-delete.git
 ```
 
 `dsh plugin add` 转发给 pnpm，装完会自动把新装的 bundle 追加到 profile 的 `dsh.profile.bundles`（依据包里 `dsh.bundle` 字段），无需手工改 `package.json`。
