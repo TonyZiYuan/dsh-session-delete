@@ -50,6 +50,7 @@ window.__ModuleLoader__.load({
         'dialog.size': '日志大小',
         'dialog.descendants': '包含子会话',
         'dialog.cascade': '将同时删除 {n} 个子会话及其后代。子会话在侧边栏不可见，无法通过其它方式单独删除。',
+        'dialog.ghost': '该会话的日志文件已不在磁盘上（此前已删除，内存中的残留对象使它重新出现在列表里）。确认将清理它的残留登记并让这一行消失。',
         'dialog.liveNote': '该会话仍在运行。删除前会先停止它的工作，然后移除日志。',
         'dialog.loading': '正在读取会话信息…',
         'dialog.failed': '无法读取会话信息：{reason}',
@@ -75,6 +76,7 @@ window.__ModuleLoader__.load({
         'dialog.size': 'Log size',
         'dialog.descendants': 'Includes subagents',
         'dialog.cascade': 'This also deletes {n} subagent session(s) and their descendants. Subagents are hidden from the sidebar and cannot be deleted separately.',
+        'dialog.ghost': 'This session\'s log is already gone from disk (deleted earlier; a leftover in-memory object resurrected the row). Confirming clears its remaining registrations and drops the row.',
         'dialog.liveNote': 'This session is still running. Its work is stopped first, then the log is removed.',
         'dialog.loading': 'Reading session…',
         'dialog.failed': 'Could not read the session: {reason}',
@@ -166,11 +168,51 @@ window.__ModuleLoader__.load({
 
       const settle = () => deleteRequest.set(null)
 
-      // No client-side list refresh exists (SessionsService exposes none), and
-      // none is needed: the Host publishes `api-session/removed` after a
-      // successful delete, the session controller records a `remove` mutation,
-      // and `projectList()` drops the row. Anything else here would be dead
-      // code pretending to help.
+      // ─── ghost reaper ────────────────────────────────────────────────────────
+      // A session the user chatted with stays resident in the Host's live
+      // session store even after its log is deleted, and the client baseline
+      // rebuild on refresh merges live sessions unconditionally — so the row
+      // resurrects (ungrouped, full text). No public API disposes another
+      // fiber's session, so instead we watch the list and re-delete any
+      // tombstoned id that appears: the Host's absent-path answers with a
+      // fresh `api-session/removed`, which drops the row again. Tombstones
+      // live exactly as long as the ghosts do (both die at host restart).
+      const tombstones = new Set()
+      const reaping = new Set()
+
+      const rememberTombstones = (ids) => {
+        for (const id of ids) if (typeof id === 'string' && id !== '') tombstones.add(id)
+      }
+
+      const reapGhost = (sessionId) => {
+        if (reaping.has(sessionId)) return
+        reaping.add(sessionId)
+        postDelete(sessionId)
+          .then((result) => {
+            rememberTombstones([sessionId, ...(Array.isArray(result?.descendants?.ids) ? result.descendants.ids : [])])
+          })
+          .catch(() => { /* the next list snapshot retries */ })
+          .finally(() => { reaping.delete(sessionId) })
+      }
+
+      ctx.inject(['sessions'], (scoped) => {
+        const sessions = scoped?.sessions ?? (typeof scoped?.get === 'function' ? scoped.get('sessions') : undefined)
+        const list = sessions?.list
+        if (list === undefined || typeof list.subscribe !== 'function') return
+        // Learn what this host generation already deleted (covers deletes made
+        // from another tab, or before this page loaded).
+        fetch(`${API}/sessions`, { headers: { accept: 'application/json' } })
+          .then((response) => (response.ok ? response.json() : null))
+          .then((payload) => { if (Array.isArray(payload?.tombstones)) rememberTombstones(payload.tombstones) })
+          .catch(() => { /* the dialog path still works; reaping starts after the next reload */ })
+        const unsubscribe = list.subscribe(() => {
+          let snapshot
+          try { snapshot = list.getSnapshot() } catch { return }
+          const ids = Array.isArray(snapshot?.ids) ? snapshot.ids : []
+          for (const id of ids) if (tombstones.has(id)) reapGhost(id)
+        })
+        scoped?.effect?.(() => unsubscribe, 'dsh-session-delete: reaper subscription')
+      })
 
       ctx.slots.inject('sidebar.workspaces.session.menu.item', () => ctx.slots.register({
         name: 'sidebar.workspaces.session.menu.item',
@@ -272,6 +314,7 @@ window.__ModuleLoader__.load({
     /** One request's dialog body. */
     function DeleteForm({ request, settle, t }) {
       const [entry, setEntry] = useState(null)
+      const [loaded, setLoaded] = useState(false)
       const [loadError, setLoadError] = useState(null)
       const [acknowledged, setAcknowledged] = useState(false)
       const [deleting, setDeleting] = useState(false)
@@ -281,7 +324,7 @@ window.__ModuleLoader__.load({
       useEffect(() => {
         let live = true
         fetchSession(request.sessionId)
-          .then((found) => { if (live) setEntry(found) })
+          .then((found) => { if (live) { setEntry(found); setLoaded(true) } })
           .catch((reason) => { if (live) setLoadError(String(reason?.message ?? reason)) })
         return () => { live = false }
       }, [request.sessionId])
@@ -322,7 +365,12 @@ window.__ModuleLoader__.load({
       const title = entry?.title || request.displayTitle || request.sessionId
       const live = entry?.live === true
       const descendants = Number(entry?.descendantCount) || 0
-      const loading = entry === null && loadError === null
+      // `loaded` — not `entry !== null` — separates "still fetching" from
+      // "fetched, and the session has no log on disk". A resurrected ghost row
+      // takes the second path: the entry is null, but the dialog must not sit
+      // on the loading line forever.
+      const loading = !loaded && loadError === null
+      const ghost = loaded && entry === null
 
       // Composed from Modal, NOT RiskConfirmation: that primitive takes no
       // `children` (its body is hardcoded to warning + checkbox), so every
@@ -349,6 +397,11 @@ window.__ModuleLoader__.load({
         loading && h('div', { key: 'loading', className: 'dsh-session-delete-loading', role: 'status' }, t('dialog.loading')),
         loadError !== null && h('div', { key: 'load-error', className: 'dsh-session-delete-error', role: 'alert' },
           t('dialog.failed', { reason: loadError })),
+
+        // A row that lists no log on disk: the live session object outlived its
+        // files (the refresh-resurrection case). Confirming re-runs the delete,
+        // whose absent path cleans registries and re-announces the removal.
+        ghost && h('div', { key: 'ghost', className: 'dsh-session-delete-note', role: 'note' }, t('dialog.ghost')),
 
         entry !== null && h('dl', { key: 'facts', className: 'dsh-session-delete-facts' }, [
           h('div', { key: 'session', className: 'dsh-session-delete-fact' }, [
@@ -377,7 +430,8 @@ window.__ModuleLoader__.load({
         descendants > 0 && h('div', { key: 'cascade', className: 'dsh-session-delete-note', role: 'note' },
           t('dialog.cascade', { n: String(descendants) })),
 
-        h('div', { key: 'export', className: 'dsh-session-delete-export' }, [
+        // The export link only makes sense while a log actually exists.
+        !ghost && h('div', { key: 'export', className: 'dsh-session-delete-export' }, [
           h('div', { key: 'hint', className: 'dsh-session-delete-export-hint' }, [
             h(IconWarningOutlineRegular, { key: 'icon', size: 14 }),
             h('span', { key: 'text' }, t('dialog.exportFirst')),

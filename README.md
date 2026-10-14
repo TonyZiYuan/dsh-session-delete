@@ -4,6 +4,19 @@
 
 DSH 自身不提供删除会话的能力：`SessionPersistence` 只有 `create`/`open`/`flush`/`stat`/`list`，`WorkspaceRegistry` 只有 `archive`/`unarchive`，两侧都没有 delete。会话日志本质上就是磁盘上的一个目录，所以本插件添加了删除操作。
 
+## 适用版本
+
+- **DSH `0.2.0-rc.2` 实测可用**（Web GUI）。本插件直接复刻 JSONL 后端的两个路径变换函数，并依赖以下内部契约，未在上游版本验证过之前不要假定兼容：
+  - `ctx.get('sessionPersistence')` 实例的公开 `root` 字段与 `list()/stat()/flush()`；
+  - `session/` 前缀的目录布局（`encodeSegment` / `projectKey`，见下文）；
+  - `workspace/session-stop` 事件与 `api-session/removed` 转发事件（`dsh-api-remotes` 白名单）；
+  - `ctx.get('workspaceRegistry')` 的 `unarchiveSession` / `unpinSession` / `detachSession`；
+  - `ctx.get('sessionQuery')` 的 `traceSession()` 后代树形状；
+  - 浏览器半身的 slot 名（`sidebar.workspaces.session.menu.item`、`shell.overlay`）与 `dsh-client-ui-primitives` 的 `Modal` / `Button` 等导出。
+- 需要 `dsh web` profile（浏览器半身 `platform: "web"`）。
+- Node `^22.19.0 || >=24.0.0`（与 DSH 本体一致）。
+- 若升级 DSH 后删除开始对**存在**的会话报 `session/absent`，或对话框组件缺失，多半是上述某个契约变了 —— 失败方向是安全的（宁可拒删不误删），对照新版源码更新 `index.js` 顶部的路径函数或组件用法即可。
+
 ## 功能
 
 - 侧边栏任意会话行的「...」菜单里新增「删除会话」（位于「归档会话」之后）
@@ -79,8 +92,22 @@ dsh --profile web --dump-config   # 应能看到 `dsh-session-delete` 条目
 4. **枚举后代子树** —— 用 Session Query 的 `traceSession()` 拿到任意深度的子会话树；没有 query 服务时回退为 `sessionPersistence.list()` 里 header 的 `parentSession` 链接（同样是内存内过滤，不是磁盘扫描）。默认连带删除整棵子树。
 5. **整树预检** —— 对父会话与每个后代**逐个**定位目录、检查是否逃出 sessions root、校验内容白名单。**全部通过才继续**；任一失败则整体中止、一个都不删。半截的血缘（父没了、某个子被拒）比全不删更糟，因为那些孤儿会立刻变得不可达。
 6. **递归删除** —— 逐个 `fs.rm(dir, { recursive: true, force: true })`。若操作系统的句柄锁挡住（Windows `EPERM`/`EBUSY`，POSIX `EACCES`/`ETXTBSY`），返回 `session/in-use`，提示关掉该会话后重试。
-7. **清理注册表** —— 对每个已删 id 都执行。优先走 `ctx.workspaceRegistry` 的 `unarchiveSession` / `unpinSession` / `detachSession`，它们同时更新内存缓存、持久化表与已连接浏览器的推流。没有 registry 组成时回退为原子改写 `workspace.json`（临时文件 + rename，并留一份 `.bak`）。此步失败**不阻断**删除，仅在响应里标记 `registryCleaned: false`。
+7. **清理注册表** —— 对每个已删 id 都执行。优先走 `ctx.get('workspaceRegistry')` 的 `unarchiveSession` / `unpinSession` / `detachSession`，它们同时更新内存缓存、持久化表与已连接浏览器的推流。（注意必须用 `ctx.get` 而不是属性访问：cordis 对未在 inject 里声明过的服务，属性解析会抛 —— 早期版本因此静默掉进回退路径。）没有 registry 组成时回退为原子改写 `workspace.json`（临时文件 + rename，并留一份 `.bak`）。此步失败**不阻断**删除，仅在响应里标记 `registryCleaned: false`。
 8. **发布移除公告** —— 对每个已删 id 都发出 `api-session/removed`，DSH 既有的转发链路会把该行从所有已连接浏览器的侧边栏移除。不发这一步，行会一直留到下次刷新。
+9. **记入墓碑** —— 被删 id（含整个子树）记入本 Host 代的内存墓碑集，供浏览器半身的"幽灵收割器"使用（见下节）。
+
+## 刷新后复活的幽灵（及其收割）
+
+聊过天的会话，其 Agent/Session 对象会常驻 Host 内存（空闲会话要能被继续对话，这是 DSH 的既定设计）。删除销毁了磁盘日志，但**没有任何公开 API 能销毁别的 fiber 持有的 live 会话对象**。而客户端列表基线合并 live 会话是无条件的（`dsh-session-query` 的 `listSessions`）—— 于是刷新浏览器后，基线从内存重建，**已删的行会复活**：出现在"未分组"下（注册表成员已清理），点开仍有完整文本（历史读取 live 优先，不碰磁盘）。
+
+本插件的应对是**墓碑 + 收割器**，两层配合：
+
+- **Host**：每次成功删除把 id 记入内存墓碑集；`GET /sessions` 响应带 `tombstones` 数组。墓碑与幽灵同生共死 —— Host 重启后两者都不存在，语义自洽。
+- **Browser**：订阅客户端会话列表快照，任何 id 若"在墓碑里却出现在列表中"（即复活的幽灵），自动再发一次删除 —— 走 absent 幂等路径，触发注册表清理与重公告，行随即掉落。**只收割墓碑内的 id**，新开的 blank 会话绝不受影响。
+
+效果：刷新后幽灵即使闪现，也会在亚秒级被收掉。手动兜底：对幽灵行点「删除会话」，对话框会显示"日志已不在磁盘"状态（而不是卡在读取），确认即可清除。
+
+> 毫秒级的闪现窗口无法在插件层根除，需要上游在基线合并处支持"已删除会话排除"。
 
 ## 子会话（subagent）怎么处理
 
@@ -117,7 +144,7 @@ JSONL 后端的目录布局是：
 
 | 方法 | 路径 | 作用 |
 |---|---|---|
-| GET | `/api/session-delete/sessions` | 可删会话清单 |
+| GET | `/api/session-delete/sessions` | 可删会话清单 + `tombstones`（本 Host 代已删 id，供收割器用） |
 | POST | `/api/session-delete/delete` | 删除（body `{sessionId, cascade?}`，`cascade` 默认 `true`） |
 
 删除响应新增 `descendants` 摘要，便于确认级联结果：
@@ -152,7 +179,7 @@ JSONL 后端的目录布局是：
 - **不做回收站/软删除** —— DSH 的归档已经是软删除，再叠一层语义混乱
 - **不改 DSH 本体** —— `node_modules` 里的 `@deepseek-ai/*` 是只读安装产物
 - **不全盘扫描 sessions 根目录** —— 目录由 header 的 `cwd` 确定性算出；后代子树由 `traceSession()` 或已在内存的 `parentSession` 链接得到，同样不碰磁盘目录枚举
-- **不留不可达的孤儿日志** —— 子会话在 UI 里无法单独删除，所以默认级联，而不是把残留丢给用户野
+- **不留不可达的孤儿日志** —— 子会话在 UI 里无法单独删除，所以默认级联，而不是把残留丢给用户
 
 ## 结构
 
@@ -162,6 +189,7 @@ dsh-session-delete/
 ├── cordis.patch.yml  # 一行 insert 挂载
 ├── index.js          # Host 半身：路径构造 + 服务 + 路由 + 信任栅栏
 ├── client.js         # Browser 半身：菜单项 + 确认对话框 + locale
+├── LICENSE           # MIT
 └── README.md
 ```
 
@@ -178,5 +206,6 @@ dsh-session-delete/
 | 删除报 `session/in-use` | 操作系统拒绝了句柄（会话仍被某个进程握着）；关掉该会话或结束占用它的进程后重试 |
 | 删除报 `session/absent` | 目录不存在；注册表残留仍会被清理。若对所有会话都这样，检查 `index.js` 的两个路径函数是否与当前 DSH 版本一致 |
 | 删除成功但侧边栏行还在 | `api-session/removed` 没发出；刷新页面可确认磁盘上确实已删。检查 Host 日志有无 registry 相关告警 |
+| 刷新后已删会话复活在"未分组" | 内存 live 对象被基线重建带回（见「幽灵」一节）。收割器会自动再删；也可对幽灵行手动点删除，对话框会显示"日志已不在磁盘"状态 |
 | 删除成功但归档列表有空白行 | `registryCleaned: false`；重启 DSH 后 bootstrap 会自行 reconcile |
 | 403 | 非回环地址发起了写请求 |

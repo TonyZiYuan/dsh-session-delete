@@ -195,6 +195,24 @@ class SessionDeleteService {
     this.homeOverride = typeof config?.home === 'string' && config.home.trim() !== '' ? path.resolve(config.home.trim()) : undefined
     /** Session id -> the snapshot the last `list()` saw. */
     this.known = new Map()
+    /**
+     * Ids deleted during this host generation whose logs are gone from disk.
+     *
+     * A session the user chatted with keeps its Agent/Session object resident
+     * in `ctx.sessions`, and the session-query corpus merge lists live sessions
+     * unconditionally — so after our delete, a browser refresh rebuilds the
+     * client baseline from that in-memory ghost, and the row reappears
+     * (ungrouped, with full text). There is no public API to dispose a
+     * session owned by another fiber, so we record what we deleted and let
+     * the browser half reap the ghosts. Tombstones live exactly as long as
+     * the ghosts do: both die at host restart.
+     */
+    this.tombstones = new Set()
+  }
+
+  /** Record one deleted id (and its subtree) for the browser-side reaper. */
+  tombstone(...ids) {
+    for (const id of ids) this.tombstones.add(id)
   }
 
   /** The JSONL backend, or undefined when the composition has none. */
@@ -219,6 +237,21 @@ class SessionDeleteService {
   get query() {
     try {
       return this.ctx.get('sessionQuery') ?? undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
+   * The durable workspace registry, or undefined when not composed.
+   *
+   * Must go through `ctx.get`, not a property access: property resolution
+   * throws for a fiber that never declared the service in its inject list,
+   * which silently pushed every cleanup onto the file-rewrite fallback.
+   */
+  get registry() {
+    try {
+      return this.ctx.get('workspaceRegistry') ?? undefined
     } catch {
       return undefined
     }
@@ -376,8 +409,11 @@ class SessionDeleteService {
     const snapshot = this.known.get(id) ?? await persistence.stat(id)
     if (snapshot === undefined) {
       // Nothing on disk. Registry cleanup still runs: an archived id whose log
-      // is already gone would otherwise linger as a blank row.
+      // is already gone would otherwise linger as a blank row. This is also
+      // the reaper's path: a resurrected ghost row re-deleted lands here, and
+      // the announcement below drops it again.
       const cleaned = await this.cleanRegistries(id)
+      this.tombstone(id)
       this.publishRemoval(id)
       return { deleted: false, absent: true, freedBytes: 0, registryCleaned: cleaned }
     }
@@ -427,6 +463,7 @@ class SessionDeleteService {
     if (targets.length === 0) {
       const cleaned = await this.cleanRegistries(id)
       for (const memberId of subtree) await this.cleanRegistries(memberId)
+      this.tombstone(id, ...subtree)
       this.publishRemoval(id)
       for (const memberId of subtree) this.publishRemoval(memberId)
       this.known.delete(id)
@@ -460,6 +497,7 @@ class SessionDeleteService {
 
     // Registries and announcement for every member that actually went.
     let cleaned = true
+    this.tombstone(...[id, ...subtree])
     for (const memberId of removedIds) {
       if ((await this.cleanRegistries(memberId)) === false) cleaned = false
       this.known.delete(memberId)
@@ -651,12 +689,7 @@ class SessionDeleteService {
     // is set, because the composed registry then belongs to a different harness
     // home than the one being cleaned.
     if (this.homeOverride === undefined) {
-      let registry
-      try {
-        registry = this.ctx?.workspaceRegistry ?? undefined
-      } catch {
-        registry = undefined // service not composed in this deployment
-      }
+      const registry = this.registry
       if (registry !== undefined) {
         try {
           const archived = registry.archivedSessionIds
@@ -872,7 +905,7 @@ function mountRoutes(ctx, service, server) {
       }
       void guard(req, res, method, async (_req, response) => {
         const entries = await service.list()
-        json(response, 200, { ok: true, sessions: entries })
+        json(response, 200, { ok: true, sessions: entries, tombstones: [...service.tombstones] })
       })
     },
   }), 'dsh-session-delete: sessions route')

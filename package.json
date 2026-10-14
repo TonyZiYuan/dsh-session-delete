@@ -1,9 +1,9 @@
 {
   "name": "dsh-session-delete",
-  "version": "0.2.0",
+  "version": "0.2.2",
   "private": true,
   "type": "module",
-  "description": "在 DSH Web 界面里删除会话：侧边栏会话行菜单新增「删除会话」，带确认对话框与导出引导。删除会移除会话日志目录并清理工作区注册表残留。",
+  "description": "在 DSH Web 界面里删除会话：侧边栏会话行菜单新增「删除会话」，带确认对话框与导出引导。删除移除会话日志目录并级联删除其子会话子树，同时清理工作区注册表。",
   "main": "./index.js",
   "exports": {
     ".": "./index.js",
